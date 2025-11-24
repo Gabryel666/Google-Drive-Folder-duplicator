@@ -1,9 +1,9 @@
 /**
  * Google Drive Duplicator
- *
+ * 
  * Logic to duplicate a folder structure from a Source ID to a Destination.
  * Handles execution time limits by saving state and allowing resumption.
- *
+ * 
  * Update: Uses Drive Files to store state (Queue) to avoid PropertiesService limits.
  */
 
@@ -33,24 +33,24 @@ function onOpen() {
 function startCopy() {
   var sheet = SpreadsheetApp.getActiveSheet();
   var ui = SpreadsheetApp.getUi();
-
+  
   // 1. Check if we have a saved job
   var state = loadState();
-
+  
   if (state) {
     // We are in the middle of a job
     var rowIndex = state.rowIndex;
     var status = sheet.getRange(rowIndex, 2).getValue();
-
+    
     if (status === 'Done') {
       clearState();
       startCopy(); // Restart fresh
       return;
     }
-
+    
     ui.alert('Resuming copy for row ' + rowIndex);
     processQueue(sheet, rowIndex, state.queue);
-
+    
   } else {
     // Find a new job
     var data = sheet.getDataRange().getValues();
@@ -58,15 +58,15 @@ function startCopy() {
     for (var i = 1; i < data.length; i++) {
       var sourceId = data[i][0];
       var status = data[i][1];
-
+      
       if (sourceId && (status === '' || status === 'Pending')) {
         var rowIndex = i + 1; // 1-based index
-
+        
         // Initialize the job
         if (!setupJob(sheet, rowIndex, sourceId)) {
           return; // Error occurred
         }
-
+        
         // Load the newly created queue
         state = loadState();
         if (state) {
@@ -75,7 +75,7 @@ function startCopy() {
         return;
       }
     }
-
+    
     ui.alert('No pending jobs found. Please add a Source Folder ID and clear the Status column.');
   }
 }
@@ -85,28 +85,28 @@ function startCopy() {
  */
 function setupJob(sheet, rowIndex, sourceId) {
   var ui = SpreadsheetApp.getUi();
-
+  
   try {
     var sourceFolder = DriveApp.getFolderById(sourceId);
     var sourceName = sourceFolder.getName();
     var destName = sourceName + " duplicate";
-
+    
     sheet.getRange(rowIndex, 2).setValue('Initializing...');
-
+    
     // Create root destination folder
     var destFolder = DriveApp.getRootFolder().createFolder(destName);
     var destId = destFolder.getId();
-
+    
     sheet.getRange(rowIndex, 3).setValue(destFolder.getUrl());
-
+    
     // Initial Queue: [ { sourceId: ..., destId: ... } ]
     var queue = [{ sourceId: sourceId, destId: destId }];
-
+    
     // Save State
     saveState(queue, rowIndex);
-
+    
     return true;
-
+    
   } catch (e) {
     sheet.getRange(rowIndex, 2).setValue('Error: ' + e.message);
     ui.alert('Error accessing source folder: ' + e.message);
@@ -119,10 +119,10 @@ function setupJob(sheet, rowIndex, sourceId) {
  */
 function processQueue(sheet, rowIndex, queue) {
   var startTime = Date.now();
-
+  
   sheet.getRange(rowIndex, 2).setValue('Processing...');
   SpreadsheetApp.flush(); // Update UI
-
+  
   try {
     while (queue.length > 0) {
       // Check Time Limit
@@ -131,15 +131,15 @@ function processQueue(sheet, rowIndex, queue) {
         sheet.getRange(rowIndex, 2).setValue('Time Limit - Resume needed');
         return;
       }
-
+      
       // Peek at the first item
       var currentItem = queue[0];
       var sourceId = currentItem.sourceId;
       var destId = currentItem.destId;
-
+      
       var sourceFolder = DriveApp.getFolderById(sourceId);
       var destFolder = DriveApp.getFolderById(destId);
-
+      
       // 1. Copy Files
       var files = sourceFolder.getFiles();
       while (files.hasNext()) {
@@ -148,13 +148,16 @@ function processQueue(sheet, rowIndex, queue) {
           sheet.getRange(rowIndex, 2).setValue('Time Limit - Resume needed');
           return;
         }
-
+        
         var file = files.next();
         try {
           // Check if file already exists (Idempotency)
           var existing = destFolder.getFilesByName(file.getName());
           if (!existing.hasNext()) {
             file.makeCopy(file.getName(), destFolder);
+            console.log('Copied file: ' + file.getName());
+          } else {
+             console.log('Skipped existing file: ' + file.getName());
           }
         } catch (fileErr) {
           console.error('Error copying file: ' + file.getName() + ' - ' + fileErr.toString());
@@ -163,7 +166,7 @@ function processQueue(sheet, rowIndex, queue) {
           currentItem.hasErrors = true;
         }
       }
-
+      
       // 2. Prepare Subfolders (Add to queue)
       if (!currentItem.childrenQueued) {
         var subIter = sourceFolder.getFolders();
@@ -177,12 +180,17 @@ function processQueue(sheet, rowIndex, queue) {
 
            var sub = subIter.next();
            var subName = sub.getName();
-
+           
            var dSub;
            var dSubIter = destFolder.getFoldersByName(subName);
-           if (dSubIter.hasNext()) dSub = dSubIter.next();
-           else dSub = destFolder.createFolder(subName);
-
+           if (dSubIter.hasNext()) {
+              dSub = dSubIter.next();
+              console.log('Found existing folder: ' + subName);
+           } else {
+              dSub = destFolder.createFolder(subName);
+              console.log('Created folder: ' + subName);
+           }
+           
            queue.push({ sourceId: sub.getId(), destId: dSub.getId() });
         }
         currentItem.childrenQueued = true;
@@ -191,17 +199,38 @@ function processQueue(sheet, rowIndex, queue) {
       // Remove item after processing
       queue.shift();
     }
-
+    
     // Finished
     var finalStatus = 'Done';
-    // If we tracked errors in the queue items, we might want to flag it.
-    // But since queue items are removed, we'd need a global flag.
-    // For simplicity, we check logs or rely on user verification.
+    
+    // Auto-Verify
+    try {
+      // Retrieve the ORIGINAL root IDs from the sheet, not the loop variables
+      var rootSourceId = sheet.getRange(rowIndex, 1).getValue();
+      var rootDestUrl = sheet.getRange(rowIndex, 3).getValue();
+      var rootDestIdMatch = rootDestUrl.match(/[-\w]{25,}/);
+      
+      if (rootSourceId && rootDestIdMatch) {
+        var rootDestId = rootDestIdMatch[0];
+        var verifyResult = internalVerify(rootSourceId, rootDestId);
+        
+        if (verifyResult.sourceCount !== verifyResult.destCount) {
+           finalStatus = "Done (Mismatch: " + verifyResult.sourceCount + " vs " + verifyResult.destCount + ". Check Logs)";
+        } else {
+           finalStatus = "Done (Verified: " + verifyResult.sourceCount + " files)";
+        }
+        // Also update verification column
+        sheet.getRange(rowIndex, 4).setValue(finalStatus.indexOf("Mismatch") !== -1 ? "MISMATCH" : "OK");
+      }
+    } catch (e) {
+      console.error("Auto-verify failed: " + e.message);
+      finalStatus = "Done (Verify Failed: " + e.message + ")";
+    }
 
     sheet.getRange(rowIndex, 2).setValue(finalStatus);
     clearState();
     SpreadsheetApp.flush();
-
+    
   } catch (e) {
     sheet.getRange(rowIndex, 2).setValue('Error: ' + e.toString());
     saveState(queue, rowIndex);
@@ -216,7 +245,7 @@ function saveState(queue, rowIndex) {
   var props = PropertiesService.getDocumentProperties();
   var fileId = props.getProperty(CONFIG.STATE_FILE_ID_KEY);
   var content = JSON.stringify({ queue: queue, rowIndex: rowIndex });
-
+  
   if (fileId) {
     try {
       var file = DriveApp.getFileById(fileId);
@@ -226,7 +255,7 @@ function saveState(queue, rowIndex) {
       // File might be deleted, create new
     }
   }
-
+  
   var file = DriveApp.getRootFolder().createFile(CONFIG.STATE_FILE_NAME, content, MimeType.PLAIN_TEXT);
   props.setProperty(CONFIG.STATE_FILE_ID_KEY, file.getId());
 }
@@ -234,9 +263,9 @@ function saveState(queue, rowIndex) {
 function loadState() {
   var props = PropertiesService.getDocumentProperties();
   var fileId = props.getProperty(CONFIG.STATE_FILE_ID_KEY);
-
+  
   if (!fileId) return null;
-
+  
   try {
     var file = DriveApp.getFileById(fileId);
     var content = file.getBlob().getDataAsString();
@@ -249,7 +278,7 @@ function loadState() {
 function clearState() {
   var props = PropertiesService.getDocumentProperties();
   var fileId = props.getProperty(CONFIG.STATE_FILE_ID_KEY);
-
+  
   if (fileId) {
     try {
       DriveApp.getFileById(fileId).setTrashed(true);
@@ -272,32 +301,31 @@ function resetMemory() {
 function verifyCopy() {
   var sheet = SpreadsheetApp.getActiveSheet();
   var row = sheet.getActiveCell().getRow();
-
+  
   var sourceId = sheet.getRange(row, 1).getValue();
   var destUrl = sheet.getRange(row, 3).getValue();
-
+  
   if (!sourceId || !destUrl) {
     SpreadsheetApp.getUi().alert('Please select a row with a valid Source ID and Destination URL.');
     return;
   }
-
+  
   try {
-    var destId = destUrl.match(/[-\w]{25,}/);
-    if (!destId) throw new Error("Invalid Dest URL");
-
+    var destIdMatch = destUrl.match(/[-\w]{25,}/);
+    if (!destIdMatch) throw new Error("Invalid Dest URL");
+    var destId = destIdMatch[0];
+    
     sheet.getRange(row, 4).setValue("Verifying...");
     SpreadsheetApp.flush();
-
-    // Warning: Simple recursion might timeout on huge folders
-    var sourceCount = countFiles(DriveApp.getFolderById(sourceId));
-    var destCount = countFiles(DriveApp.getFolderById(destId[0]));
-
-    var msg = "Source: " + sourceCount + " | Dest: " + destCount;
-    if (sourceCount === destCount) msg = "OK (" + sourceCount + ")";
-    else msg = "MISMATCH: " + msg;
-
+    
+    var res = internalVerify(sourceId, destId);
+    
+    var msg = "Source: " + res.sourceCount + " | Dest: " + res.destCount;
+    if (res.sourceCount === res.destCount) msg = "OK (" + res.sourceCount + ")";
+    else msg = "MISMATCH: " + msg + ". Check Console Logs.";
+    
     sheet.getRange(row, 4).setValue(msg);
-
+    
   } catch (e) {
     var errorMsg = e.message;
     if (e.toString().indexOf("Exceeded maximum execution time") !== -1) {
@@ -307,19 +335,27 @@ function verifyCopy() {
   }
 }
 
+function internalVerify(sourceId, destId) {
+   // Warning: Simple recursion might timeout on huge folders.
+   // Ideally, this should also be queue-based, but for now we keep it simple.
+   var sourceCount = countFiles(DriveApp.getFolderById(sourceId));
+   var destCount = countFiles(DriveApp.getFolderById(destId));
+   return { sourceCount: sourceCount, destCount: destCount };
+}
+
 function countFiles(folder) {
   var count = 0;
-
+  
   var files = folder.getFiles();
   while (files.hasNext()) {
     files.next();
     count++;
   }
-
+  
   var subs = folder.getFolders();
   while (subs.hasNext()) {
     count += countFiles(subs.next());
   }
-
+  
   return count;
 }

@@ -576,9 +576,17 @@ function ensureLogsSheet() {
 function logToSheet(jobRowIndex, type, name, message) {
   try {
     var sheet = ensureLogsSheet();
-    sheet.appendRow([new Date(), jobRowIndex, type, name, message]);
+    // Flush periodically to avoid "Service Spreadsheets failed" on heavy load
+    // We add a tiny delay or use lock, but simple retry is often enough.
+    try {
+      sheet.appendRow([new Date(), jobRowIndex, type, name, message]);
+    } catch (writeErr) {
+       // Retry once after waiting
+       Utilities.sleep(2000);
+       sheet.appendRow([new Date(), jobRowIndex, type, name, message]);
+    }
   } catch (e) {
-    console.error("Failed to log to sheet: " + e.message);
+    console.error("Failed to log to sheet (Fatal): " + e.message);
   }
 }
 

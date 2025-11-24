@@ -1,49 +1,51 @@
 # Google Drive Duplicator
 
-Ce projet permet de dupliquer une arborescence complète d'un dossier Google Drive (partagé ou non) vers votre propre Drive.
+This project allows you to duplicate a complete folder structure from a Google Drive folder (shared or not) to your own Drive.
 
-## Fonctionnalités
+## Features
 
-*   **Copie Récursive** : Copie tous les fichiers et sous-dossiers.
-*   **Gestion des Limites** : Gère la limite de temps de 6 minutes de Google Apps Script. Si la copie n'est pas finie, vous pouvez la relancer et elle reprendra exactement où elle s'est arrêtée.
-*   **Vérification** : Compare le nombre de fichiers entre la source et la destination pour s'assurer de l'intégrité.
-*   **Interface Google Sheets** : Pilotage facile via un tableau.
+*   **Recursive Copy**: Copies all files and subfolders.
+*   **Time Limit Management**: Handles the 6-minute execution time limit of Google Apps Script. If the copy isn't finished, you can resume it, and it will pick up exactly where it left off.
+*   **Verification**: Compares the file count between the source and destination to ensure integrity.
+*   **Google Sheets Interface**: Easy control via a spreadsheet.
 
 ## Installation
 
-### Option A : Copier-Coller (Simple)
+### Option A: Copy-Paste (Simple)
 
-1.  Créez un nouveau **Google Sheet**.
-2.  Allez dans **Extensions** > **Apps Script**.
-3.  Supprimez le code existant dans `Code.gs`.
-4.  Copiez le contenu du fichier `src/Code.js` de ce dépôt et collez-le dans l'éditeur.
-5.  Sauvegardez.
-6.  Rechargez votre Google Sheet. Un menu "Drive Duplicator" apparaîtra.
+1.  Create a new **Google Sheet**.
+2.  Go to **Extensions** > **Apps Script**.
+3.  Delete existing code in `Code.gs`.
+4.  Copy the content of the `src/Code.js` file from this repository and paste it into the editor.
+5.  Save.
+6.  Reload your Google Sheet. A "Drive Duplicator" menu will appear.
 
-### Option B : Utilisation de CLASP (Avancé)
+### Option B: Using CLASP (Advanced)
 
-Si vous avez Node.js installé :
+If you have Node.js installed:
 
-1.  Installez clasp : `npm install -g @google/clasp`
-2.  Connectez-vous : `clasp login`
-3.  Créez un sheet : `clasp create --type sheets --title "Drive Duplicator"` (ou clonez un projet existant).
-4.  Poussez le code : `clasp push`
+1.  Install clasp: `npm install -g @google/clasp`
+2.  Login: `clasp login`
+3.  Create a sheet: `clasp create --type sheets --title "Drive Duplicator"` (or clone an existing project).
+4.  Push the code: `clasp push`
 
-## Configuration du Google Sheet
+## Google Sheet Configuration
 
-Le script s'attend à trouver les colonnes suivantes (l'ordre n'est pas strict, mais c'est mieux de suivre cet en-tête) :
+The script expects the following columns (order isn't strict, but headers help):
 
-| Ligne 1 | A | B | C | D |
+| Row 1 | A | B | C | D |
 | :--- | :--- | :--- | :--- | :--- |
-| **En-têtes** | **Source Folder ID** | **Status** | **Destination URL** | **Verification** |
+| **Headers** | **Source Folder ID** | **Status** | **Destination URL** | **Verification** |
 
-*   **Source Folder ID** : L'ID du dossier que vous voulez copier (la partie à la fin de l'URL du dossier).
-*   **Status** : Laissez vide au début. Le script mettra "Pending", "Processing", "Done", ou "Error".
+*   **Source Folder ID**: The ID of the folder you want to copy (the part at the end of the folder URL).
+*   **Status**: Leave empty initially. The script will update it to "Pending", "Processing", "Done", or "Error".
+*   **Destination URL**: Populated by the script.
+*   **Verification**: Populated by the verification tool.
 
-## Utilisation
+## Usage
 
-1.  Remplissez l'ID du dossier source dans la colonne A.
-2.  Allez dans le menu **Drive Duplicator** > **Start Copy**.
-3.  Si le script s'arrête (limite de temps), le statut restera "Processing" (ou indiquera "Time Limit"). Relancez simplement **Start Copy** pour continuer.
-4.  Une fois terminé, le statut sera "Done".
-5.  Pour vérifier, cliquez sur **Drive Duplicator** > **Verify Folder**.
+1.  Fill in the Source Folder ID in column A.
+2.  Go to the menu **Drive Duplicator** > **Start Copy**.
+3.  If the script stops (time limit), the status will remain "Processing" (or indicate "Time Limit"). Simply click **Start Copy** again to resume.
+4.  Once finished, the status will be "Done".
+5.  To verify, click **Drive Duplicator** > **Verify Folder**.

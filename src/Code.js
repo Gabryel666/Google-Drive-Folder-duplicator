@@ -21,7 +21,7 @@ function onOpen() {
   var ui = SpreadsheetApp.getUi();
   ui.createMenu('Drive Duplicator')
       .addItem('Start / Resume Copy', 'startCopy')
-      .addItem('Verify Folder', 'verifyCopy')
+      .addItem('Start / Resume Verify', 'verifyCopy')
       .addSeparator()
       .addItem('Reset / Clear Memory', 'resetMemory')
       .addToUi();
@@ -40,16 +40,24 @@ function startCopy() {
   if (state) {
     // We are in the middle of a job
     var rowIndex = state.rowIndex;
-    var status = sheet.getRange(rowIndex, 2).getValue();
+    var colStatus = (state.type === 'VERIFY') ? 4 : 2; // Column D or B
+    var status = sheet.getRange(rowIndex, colStatus).getValue();
     
-    if (status === 'Done') {
+    if (status.indexOf('Done') === 0) { // Starts with Done
       clearState();
-      startCopy(); // Restart fresh
+      deleteResumeTriggers();
+      // Only restart if it was a copy job, otherwise stop (don't auto-restart verify)
+      if (state.type !== 'VERIFY') {
+        startCopy();
+      }
       return;
     }
     
-    ui.alert('Resuming copy for row ' + rowIndex);
-    processQueue(sheet, rowIndex, state.queue);
+    if (state.type === 'VERIFY') {
+      processVerifyQueue(sheet, rowIndex, state);
+    } else {
+      processQueue(sheet, rowIndex, state);
+    }
     
   } else {
     // Find a new job
@@ -70,7 +78,7 @@ function startCopy() {
         // Load the newly created queue
         state = loadState();
         if (state) {
-            processQueue(sheet, rowIndex, state.queue);
+            processQueue(sheet, rowIndex, state);
         }
         return;
       }
@@ -99,11 +107,11 @@ function setupJob(sheet, rowIndex, sourceId) {
     
     sheet.getRange(rowIndex, 3).setValue(destFolder.getUrl());
     
-    // Initial Queue: [ { sourceId: ..., destId: ... } ]
-    var queue = [{ sourceId: sourceId, destId: destId }];
+    // Initial Queue: [ { sourceId: ..., destId: ..., stage: 'FILES' } ]
+    var queue = [{ sourceId: sourceId, destId: destId, stage: 'FILES' }];
     
     // Save State
-    saveState(queue, rowIndex);
+    saveState({ queue: queue, rowIndex: rowIndex, totalCopied: 0 });
     
     return true;
     
@@ -117,123 +125,138 @@ function setupJob(sheet, rowIndex, sourceId) {
 /**
  * Processes the queue until finished or time runs out.
  */
-function processQueue(sheet, rowIndex, queue) {
+function processQueue(sheet, rowIndex, state) {
+  var queue = state.queue;
+  var totalCopied = state.totalCopied || 0;
   var startTime = Date.now();
   
-  sheet.getRange(rowIndex, 2).setValue('Processing...');
+  sheet.getRange(rowIndex, 2).setValue('Processing... (' + totalCopied + ' files)');
   SpreadsheetApp.flush(); // Update UI
   
   try {
     while (queue.length > 0) {
-      // Check Time Limit
-      if (Date.now() - startTime > CONFIG.TIME_LIMIT_MS) {
-        saveState(queue, rowIndex);
-        sheet.getRange(rowIndex, 2).setValue('Time Limit - Resume needed');
-        return;
-      }
-      
-      // Peek at the first item
       var currentItem = queue[0];
-      var sourceId = currentItem.sourceId;
-      var destId = currentItem.destId;
       
-      var sourceFolder = DriveApp.getFolderById(sourceId);
-      var destFolder = DriveApp.getFolderById(destId);
+      // Initialize stage if not set
+      if (!currentItem.stage) currentItem.stage = 'FILES';
+
+      var sourceFolder = DriveApp.getFolderById(currentItem.sourceId);
+      var destFolder = DriveApp.getFolderById(currentItem.destId);
       
-      // 1. Copy Files
-      var files = sourceFolder.getFiles();
-      while (files.hasNext()) {
-        if (Date.now() - startTime > CONFIG.TIME_LIMIT_MS) {
-          saveState(queue, rowIndex);
-          sheet.getRange(rowIndex, 2).setValue('Time Limit - Resume needed');
-          return;
+      // --- STAGE: FILES ---
+      if (currentItem.stage === 'FILES') {
+        var files;
+        if (currentItem.fileToken) {
+          try {
+            files = DriveApp.continueFileIterator(currentItem.fileToken);
+          } catch (e) {
+             // Token expired or invalid
+             logToSheet(rowIndex, 'WARN', 'File Iterator', 'Token expired. Restarting folder files.');
+             files = sourceFolder.getFiles();
+          }
+        } else {
+          files = sourceFolder.getFiles();
         }
         
-        var file = files.next();
-        try {
-          // Check if file already exists (Idempotency)
-          var existing = destFolder.getFilesByName(file.getName());
-          if (!existing.hasNext()) {
-            file.makeCopy(file.getName(), destFolder);
-            console.log('Copied file: ' + file.getName());
-          } else {
-             console.log('Skipped existing file: ' + file.getName());
+        while (files.hasNext()) {
+          // Check Time Limit
+          if (Date.now() - startTime > CONFIG.TIME_LIMIT_MS) {
+            currentItem.fileToken = files.getContinuationToken();
+            saveState({ queue: queue, rowIndex: rowIndex, totalCopied: totalCopied });
+            createResumeTrigger();
+            sheet.getRange(rowIndex, 2).setValue('Pausing... (' + totalCopied + ' files)');
+            return;
           }
-        } catch (fileErr) {
-          console.error('Error copying file: ' + file.getName() + ' - ' + fileErr.toString());
-          // Log a warning in the status but don't stop the whole process
-          // We mark it as dirty so the status reflects it at the end
-          currentItem.hasErrors = true;
+
+          var file = files.next();
+          try {
+            // Check if file already exists (Idempotency)
+            var existing = destFolder.getFilesByName(file.getName());
+            if (!existing.hasNext()) {
+              file.makeCopy(file.getName(), destFolder);
+              totalCopied++;
+            } else {
+              // We count existing files as "processed" to give accurate progress feeling
+              totalCopied++;
+            }
+
+            // Update UI periodically
+            if (totalCopied % 20 === 0) {
+              sheet.getRange(rowIndex, 2).setValue('Processing... (' + totalCopied + ' files)');
+            }
+          } catch (fileErr) {
+            logToSheet(rowIndex, 'ERROR', file.getName(), fileErr.message);
+          }
         }
+
+        // Done with files, move to folders
+        currentItem.stage = 'FOLDERS';
+        delete currentItem.fileToken;
       }
       
-      // 2. Prepare Subfolders (Add to queue)
-      if (!currentItem.childrenQueued) {
-        var subIter = sourceFolder.getFolders();
-        while (subIter.hasNext()) {
-           // We do check timer here loosely to avoid massive blocking
-           if (Date.now() - startTime > CONFIG.TIME_LIMIT_MS) {
-              saveState(queue, rowIndex);
-              sheet.getRange(rowIndex, 2).setValue('Time Limit - Resume needed');
+      // --- STAGE: FOLDERS ---
+      if (currentItem.stage === 'FOLDERS') {
+         var folders;
+         if (currentItem.folderToken) {
+           try {
+             folders = DriveApp.continueFolderIterator(currentItem.folderToken);
+           } catch (e) {
+             logToSheet(rowIndex, 'WARN', 'Folder Iterator', 'Token expired. Restarting folder subs.');
+             folders = sourceFolder.getFolders();
+           }
+         } else {
+           folders = sourceFolder.getFolders();
+         }
+
+         while (folders.hasNext()) {
+            // Check Time Limit
+            if (Date.now() - startTime > CONFIG.TIME_LIMIT_MS) {
+              currentItem.folderToken = folders.getContinuationToken();
+              saveState({ queue: queue, rowIndex: rowIndex, totalCopied: totalCopied });
+              createResumeTrigger();
+              sheet.getRange(rowIndex, 2).setValue('Pausing... (' + totalCopied + ' files)');
               return;
-           }
+            }
 
-           var sub = subIter.next();
-           var subName = sub.getName();
-           
-           var dSub;
-           var dSubIter = destFolder.getFoldersByName(subName);
-           if (dSubIter.hasNext()) {
-              dSub = dSubIter.next();
-              console.log('Found existing folder: ' + subName);
-           } else {
-              dSub = destFolder.createFolder(subName);
-              console.log('Created folder: ' + subName);
-           }
-           
-           queue.push({ sourceId: sub.getId(), destId: dSub.getId() });
-        }
-        currentItem.childrenQueued = true;
+            var sub = folders.next();
+            try {
+              var subName = sub.getName();
+              var dSub;
+              var dSubIter = destFolder.getFoldersByName(subName);
+              if (dSubIter.hasNext()) {
+                dSub = dSubIter.next();
+              } else {
+                dSub = destFolder.createFolder(subName);
+              }
+
+              // Add to queue
+              queue.push({ sourceId: sub.getId(), destId: dSub.getId(), stage: 'FILES' });
+
+            } catch (folderErr) {
+              logToSheet(rowIndex, 'ERROR', sub.getName(), folderErr.message);
+            }
+         }
+
+         // Done with folders
+         queue.shift(); // Remove current item
       }
-
-      // Remove item after processing
-      queue.shift();
     }
     
     // Finished
-    var finalStatus = 'Done';
-    
-    // Auto-Verify
-    try {
-      // Retrieve the ORIGINAL root IDs from the sheet, not the loop variables
-      var rootSourceId = sheet.getRange(rowIndex, 1).getValue();
-      var rootDestUrl = sheet.getRange(rowIndex, 3).getValue();
-      var rootDestIdMatch = rootDestUrl.match(/[-\w]{25,}/);
-      
-      if (rootSourceId && rootDestIdMatch) {
-        var rootDestId = rootDestIdMatch[0];
-        var verifyResult = internalVerify(rootSourceId, rootDestId);
-        
-        if (verifyResult.sourceCount !== verifyResult.destCount) {
-           finalStatus = "Done (Mismatch: " + verifyResult.sourceCount + " vs " + verifyResult.destCount + ". Check Logs)";
-        } else {
-           finalStatus = "Done (Verified: " + verifyResult.sourceCount + " files)";
-        }
-        // Also update verification column
-        sheet.getRange(rowIndex, 4).setValue(finalStatus.indexOf("Mismatch") !== -1 ? "MISMATCH" : "OK");
-      }
-    } catch (e) {
-      console.error("Auto-verify failed: " + e.message);
-      finalStatus = "Done (Verify Failed: " + e.message + ")";
-    }
-
+    deleteResumeTriggers();
+    var finalStatus = 'Done. (' + totalCopied + ' files processed)';
     sheet.getRange(rowIndex, 2).setValue(finalStatus);
     clearState();
+
+    // Run verification if requested (but safe version?)
+    // For now, let's just log completion.
+    logToSheet(rowIndex, 'INFO', 'Job', 'Copy Completed. Files: ' + totalCopied);
     SpreadsheetApp.flush();
     
   } catch (e) {
     sheet.getRange(rowIndex, 2).setValue('Error: ' + e.toString());
-    saveState(queue, rowIndex);
+    logToSheet(rowIndex, 'CRITICAL', 'ProcessQueue', e.toString());
+    saveState({ queue: queue, rowIndex: rowIndex, totalCopied: totalCopied });
   }
 }
 
@@ -241,10 +264,10 @@ function processQueue(sheet, rowIndex, queue) {
 // STATE MANAGEMENT (File Based)
 // ----------------------------------------------------------------------------
 
-function saveState(queue, rowIndex) {
+function saveState(stateData) {
   var props = PropertiesService.getDocumentProperties();
   var fileId = props.getProperty(CONFIG.STATE_FILE_ID_KEY);
-  var content = JSON.stringify({ queue: queue, rowIndex: rowIndex });
+  var content = JSON.stringify(stateData);
   
   if (fileId) {
     try {
@@ -291,7 +314,8 @@ function clearState() {
 
 function resetMemory() {
   clearState();
-  SpreadsheetApp.getUi().alert('Memory cleared. You can start a new copy.');
+  deleteResumeTriggers();
+  SpreadsheetApp.getUi().alert('Memory cleared and triggers removed. You can start a new copy or verification.');
 }
 
 // ----------------------------------------------------------------------------
@@ -300,13 +324,20 @@ function resetMemory() {
 
 function verifyCopy() {
   var sheet = SpreadsheetApp.getActiveSheet();
+  var ui = SpreadsheetApp.getUi();
   var row = sheet.getActiveCell().getRow();
   
+  // Check if busy
+  if (loadState()) {
+    ui.alert("A job (Copy or Verify) is already in progress. Please wait for it to finish or reset memory.");
+    return;
+  }
+
   var sourceId = sheet.getRange(row, 1).getValue();
   var destUrl = sheet.getRange(row, 3).getValue();
   
   if (!sourceId || !destUrl) {
-    SpreadsheetApp.getUi().alert('Please select a row with a valid Source ID and Destination URL.');
+    ui.alert('Please select a row with a valid Source ID and Destination URL.');
     return;
   }
   
@@ -315,47 +346,193 @@ function verifyCopy() {
     if (!destIdMatch) throw new Error("Invalid Dest URL");
     var destId = destIdMatch[0];
     
-    sheet.getRange(row, 4).setValue("Verifying...");
+    sheet.getRange(row, 4).setValue("Initializing Verification...");
     SpreadsheetApp.flush();
     
-    var res = internalVerify(sourceId, destId);
+    // Initialize Verify Job
+    var queue = [{ sourceId: sourceId, destId: destId, stage: 'FILES' }];
+    var state = {
+      type: 'VERIFY',
+      queue: queue,
+      rowIndex: row,
+      checked: 0,
+      mismatches: 0
+    };
     
-    var msg = "Source: " + res.sourceCount + " | Dest: " + res.destCount;
-    if (res.sourceCount === res.destCount) msg = "OK (" + res.sourceCount + ")";
-    else msg = "MISMATCH: " + msg + ". Check Console Logs.";
-    
-    sheet.getRange(row, 4).setValue(msg);
+    saveState(state);
+    processVerifyQueue(sheet, row, state);
     
   } catch (e) {
-    var errorMsg = e.message;
-    if (e.toString().indexOf("Exceeded maximum execution time") !== -1) {
-       errorMsg = "Timeout (Folder too big)";
+    sheet.getRange(row, 4).setValue("Error: " + e.message);
+  }
+}
+
+function processVerifyQueue(sheet, rowIndex, state) {
+  var queue = state.queue;
+  var checked = state.checked || 0;
+  var mismatches = state.mismatches || 0;
+  var startTime = Date.now();
+
+  sheet.getRange(rowIndex, 4).setValue('Verifying... (' + checked + ' checked)');
+  SpreadsheetApp.flush();
+
+  try {
+    while (queue.length > 0) {
+      var currentItem = queue[0];
+      if (!currentItem.stage) currentItem.stage = 'FILES';
+
+      var sourceFolder = DriveApp.getFolderById(currentItem.sourceId);
+      var destFolder = DriveApp.getFolderById(currentItem.destId);
+
+      // --- STAGE: FILES ---
+      if (currentItem.stage === 'FILES') {
+        var files;
+        if (currentItem.fileToken) {
+           try {
+             files = DriveApp.continueFileIterator(currentItem.fileToken);
+           } catch (e) {
+             logToSheet(rowIndex, 'WARN', 'Verify-Files', 'Token expired, restarting folder.');
+             files = sourceFolder.getFiles();
+           }
+        } else {
+           files = sourceFolder.getFiles();
+        }
+
+        while (files.hasNext()) {
+          // Time Limit
+          if (Date.now() - startTime > CONFIG.TIME_LIMIT_MS) {
+            currentItem.fileToken = files.getContinuationToken();
+            saveState(state);
+            createResumeTrigger();
+            sheet.getRange(rowIndex, 4).setValue('Verifying... (Resume needed)');
+            return;
+          }
+
+          var file = files.next();
+          checked++;
+
+          // Verify existence
+          var existing = destFolder.getFilesByName(file.getName());
+          if (!existing.hasNext()) {
+             mismatches++;
+             logToSheet(rowIndex, 'MISSING', file.getName(), 'File missing in destination');
+          }
+        }
+
+        currentItem.stage = 'FOLDERS';
+        delete currentItem.fileToken;
+      }
+
+      // --- STAGE: FOLDERS ---
+      if (currentItem.stage === 'FOLDERS') {
+        var folders;
+        if (currentItem.folderToken) {
+           try {
+             folders = DriveApp.continueFolderIterator(currentItem.folderToken);
+           } catch (e) {
+             logToSheet(rowIndex, 'WARN', 'Verify-Folders', 'Token expired, restarting folder.');
+             folders = sourceFolder.getFolders();
+           }
+        } else {
+           folders = sourceFolder.getFolders();
+        }
+
+        while (folders.hasNext()) {
+           // Time Limit
+           if (Date.now() - startTime > CONFIG.TIME_LIMIT_MS) {
+            currentItem.folderToken = folders.getContinuationToken();
+            saveState(state);
+            createResumeTrigger();
+            sheet.getRange(rowIndex, 4).setValue('Verifying... (Resume needed)');
+            return;
+          }
+
+          var sub = folders.next();
+          var subName = sub.getName();
+
+          var dSubIter = destFolder.getFoldersByName(subName);
+          if (dSubIter.hasNext()) {
+            var dSub = dSubIter.next();
+            queue.push({ sourceId: sub.getId(), destId: dSub.getId(), stage: 'FILES' });
+          } else {
+            mismatches++;
+            logToSheet(rowIndex, 'MISSING_DIR', subName, 'Folder missing in destination');
+          }
+        }
+
+        queue.shift();
+      }
     }
-    sheet.getRange(row, 4).setValue("Error: " + errorMsg);
+
+    // Done
+    deleteResumeTriggers();
+    clearState();
+
+    var resultMsg = "Done. " + checked + " files checked.";
+    if (mismatches > 0) {
+      resultMsg += " " + mismatches + " ISSUES (See Logs)";
+    } else {
+      resultMsg += " Perfect Match.";
+    }
+    sheet.getRange(rowIndex, 4).setValue(resultMsg);
+
+  } catch (e) {
+    sheet.getRange(rowIndex, 4).setValue('Error: ' + e.message);
+    logToSheet(rowIndex, 'CRITICAL', 'Verify', e.toString());
+    saveState(state);
   }
 }
 
-function internalVerify(sourceId, destId) {
-   // Warning: Simple recursion might timeout on huge folders.
-   // Ideally, this should also be queue-based, but for now we keep it simple.
-   var sourceCount = countFiles(DriveApp.getFolderById(sourceId));
-   var destCount = countFiles(DriveApp.getFolderById(destId));
-   return { sourceCount: sourceCount, destCount: destCount };
+// ----------------------------------------------------------------------------
+// LOGGING & TRIGGERS
+// ----------------------------------------------------------------------------
+
+/**
+ * Ensures the "Logs" sheet exists.
+ */
+function ensureLogsSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Logs");
+  if (!sheet) {
+    sheet = ss.insertSheet("Logs");
+    sheet.appendRow(["Timestamp", "Job Row", "Type", "File/Folder", "Message"]);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
 }
 
-function countFiles(folder) {
-  var count = 0;
-  
-  var files = folder.getFiles();
-  while (files.hasNext()) {
-    files.next();
-    count++;
+/**
+ * Logs an entry to the "Logs" sheet.
+ */
+function logToSheet(jobRowIndex, type, name, message) {
+  try {
+    var sheet = ensureLogsSheet();
+    sheet.appendRow([new Date(), jobRowIndex, type, name, message]);
+  } catch (e) {
+    console.error("Failed to log to sheet: " + e.message);
   }
-  
-  var subs = folder.getFolders();
-  while (subs.hasNext()) {
-    count += countFiles(subs.next());
+}
+
+/**
+ * Creates a one-time trigger to resume execution after 1 minute.
+ */
+function createResumeTrigger() {
+  // Avoid duplicate triggers
+  deleteResumeTriggers();
+  ScriptApp.newTrigger('startCopy')
+      .timeBased()
+      .after(60 * 1000) // 1 minute
+      .create();
+}
+
+/**
+ * Deletes any existing triggers for 'startCopy'.
+ */
+function deleteResumeTriggers() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'startCopy') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
   }
-  
-  return count;
 }
